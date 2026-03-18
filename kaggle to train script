@@ -32,11 +32,11 @@ PAIR_TO_CURR = {
     'AUDUSD': ('AUD', 'USD'),
 }
 
-CHUNK_LEN = 32              # more context, one decision on last bar only
-D_MODEL = 64               # small enough for this dataset
-LOCAL_DIM = 48
-SHARED_DIM = 48
-HIDDEN_DIM = 64
+CHUNK_LEN = 64              # deeper 15m context, one decision on last bar only
+D_MODEL = 96               # richer currency state capacity for 15m microstructure
+LOCAL_DIM = 64
+SHARED_DIM = 64
+HIDDEN_DIM = 96
 EPOCHS = 50
 PATIENCE = 3
 LR = 2e-4
@@ -55,14 +55,14 @@ BACKTEST_START = "2026-02-01"
 BACKTEST_END   = "2026-03-13"
 PURGE_BARS = 8
 
-DATASET_INTERVAL = '30m'
-BARSPERYEAR_30M = 11088
-BARSPERYEAR = BARSPERYEAR_30M
+DATASET_INTERVAL = '15m'
+BARSPERYEAR_15M = 22176
+BARSPERYEAR = BARSPERYEAR_15M
 
 ATR_PERIOD = 14
 K_TP = 2.0
 K_SL = 1.5
-MAX_HOLD = 6
+MAX_HOLD = 12
 
 SPREAD_BPS = 2.0          # stricter than old runs
 TARGET_GATE_RATE = 0.18
@@ -70,7 +70,7 @@ EDGE_QUANTILE = 0.82      # positive gate labels are rare-ish
 EDGE_COST_BUFFER = 1.8 * SPREAD_BPS * 1e-4
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print("TITAN-NL v7.0: Trader-First / Currency-Aware / Ledger-First")
+print("TITAN-NL v7.5: Trader-First / Currency-Aware / Multi-Scale 15m")
 print(f"Device: {DEVICE}")
 
 # ============================================================
@@ -224,37 +224,49 @@ class DecisionForexDataset(Dataset):
 # ============================================================
 # 5. MODEL
 # ============================================================
-class LocalTemporalEncoder(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int = LOCAL_DIM):
+class MultiScaleTemporalEncoder(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int):
         super().__init__()
+        branch_dim = hidden_dim // 2
         self.proj = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU()
+            nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim)
         )
-        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.fast_conv = nn.Conv1d(hidden_dim, branch_dim, kernel_size=3, padding=1)
+        self.medium_conv = nn.Conv1d(hidden_dim, branch_dim, kernel_size=7, padding=3)
+        self.fast_gru = nn.GRU(branch_dim, branch_dim, batch_first=True)
+        self.medium_gru = nn.GRU(branch_dim, branch_dim, batch_first=True)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads=4, batch_first=True, dropout=0.1)
+        self.ff = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 2), nn.GELU(), nn.Dropout(0.1),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.out = nn.Sequential(nn.Linear(hidden_dim * 3, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, S, F]
         h = self.proj(x)
-        out, _ = self.gru(h)
-        return self.norm(out[:, -1])
+        conv_in = h.transpose(1, 2)
+        fast = F.gelu(self.fast_conv(conv_in)).transpose(1, 2)
+        medium = F.gelu(self.medium_conv(conv_in)).transpose(1, 2)
+        fast_seq, _ = self.fast_gru(fast)
+        medium_seq, _ = self.medium_gru(medium)
+        attn_out, _ = self.attn(h, h, h, need_weights=False)
+        h = self.norm1(h + attn_out)
+        h = self.norm2(h + self.ff(h))
+        pooled = h[:, -1]
+        return self.out(torch.cat([fast_seq[:, -1], medium_seq[:, -1], pooled], dim=-1))
 
 
-class SharedTemporalEncoder(nn.Module):
+class LocalTemporalEncoder(MultiScaleTemporalEncoder):
+    def __init__(self, in_dim: int, hidden_dim: int = LOCAL_DIM):
+        super().__init__(in_dim, hidden_dim)
+
+
+class SharedTemporalEncoder(MultiScaleTemporalEncoder):
     def __init__(self, in_dim: int, hidden_dim: int = SHARED_DIM):
-        super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim), nn.GELU(), nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim), nn.GELU()
-        )
-        self.gru = nn.GRU(hidden_dim, hidden_dim, batch_first=True)
-        self.norm = nn.LayerNorm(hidden_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.proj(x)
-        out, _ = self.gru(h)
-        return self.norm(out[:, -1])
+        super().__init__(in_dim, hidden_dim)
 
 
 class CurrencyAwareTrader(nn.Module):
@@ -268,19 +280,25 @@ class CurrencyAwareTrader(nn.Module):
 
         self.to_currency = nn.Sequential(
             nn.Linear(LOCAL_DIM + SHARED_DIM, D_MODEL), nn.GELU(), nn.LayerNorm(D_MODEL),
-            nn.Linear(D_MODEL, D_MODEL)
+            nn.Linear(D_MODEL, D_MODEL), nn.GELU(), nn.LayerNorm(D_MODEL)
         )
-        self.currency_gate = nn.Sequential(nn.Linear(D_MODEL, 1), nn.Sigmoid())
+        self.currency_gate = nn.Sequential(nn.Linear(D_MODEL, D_MODEL // 2), nn.GELU(), nn.Linear(D_MODEL // 2, 1), nn.Sigmoid())
 
-        pair_input_dim = LOCAL_DIM + SHARED_DIM + 2 * D_MODEL + D_MODEL
+        pair_input_dim = LOCAL_DIM + SHARED_DIM + 3 * D_MODEL
         self.pair_mixer = nn.Sequential(
             nn.Linear(pair_input_dim, HIDDEN_DIM), nn.GELU(), nn.LayerNorm(HIDDEN_DIM),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM), nn.GELU(), nn.Dropout(0.1)
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM), nn.GELU(), nn.Dropout(0.10),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM), nn.GELU(), nn.LayerNorm(HIDDEN_DIM)
+        )
+        self.global_pair_proj = nn.Linear(D_MODEL, HIDDEN_DIM)
+        self.cross_pair_attn = nn.MultiheadAttention(HIDDEN_DIM, num_heads=4, batch_first=True, dropout=0.1)
+        self.post_pair = nn.Sequential(
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM), nn.GELU(), nn.Dropout(0.1), nn.LayerNorm(HIDDEN_DIM)
         )
 
-        self.edge_head = nn.Linear(HIDDEN_DIM, 1)       # logits
-        self.dir_head  = nn.Linear(HIDDEN_DIM, 1)       # logits
-        self.size_head = nn.Linear(HIDDEN_DIM, 1)       # logits -> sigmoid * max_size
+        self.edge_head = nn.Linear(HIDDEN_DIM, 1)
+        self.dir_head  = nn.Linear(HIDDEN_DIM, 1)
+        self.size_head = nn.Linear(HIDDEN_DIM, 1)
         self.tp_head   = nn.Sequential(nn.Linear(HIDDEN_DIM, 1), nn.Softplus())
         self.sl_head   = nn.Sequential(nn.Linear(HIDDEN_DIM, 1), nn.Softplus())
         self.hold_head = nn.Sequential(nn.Linear(HIDDEN_DIM, 1), nn.Softplus())
@@ -294,11 +312,10 @@ class CurrencyAwareTrader(nn.Module):
                 nn.init.xavier_uniform_(m.weight, gain=0.7)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        nn.init.constant_(self.edge_head.bias, -1.6)  # starts conservative
+        nn.init.constant_(self.edge_head.bias, -1.6)
         nn.init.constant_(self.size_head.bias, -1.2)
 
     def build_currency_states(self, pair_local: torch.Tensor, shared_state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # pair_local: [B, N, LOCAL_DIM], shared_state: [B, SHARED_DIM]
         B, N, _ = pair_local.shape
         device = pair_local.device
         curr_sum = torch.zeros(B, NUM_CURR, D_MODEL, device=device)
@@ -306,15 +323,15 @@ class CurrencyAwareTrader(nn.Module):
 
         sh = shared_state.unsqueeze(1).expand(-1, N, -1)
         pair_for_curr = torch.cat([pair_local, sh], dim=-1)
-        pair_curr_feat = self.to_currency(pair_for_curr)  # [B,N,D]
-        pair_curr_gate = self.currency_gate(pair_curr_feat)  # [B,N,1]
+        pair_curr_feat = self.to_currency(pair_for_curr)
+        pair_curr_gate = self.currency_gate(pair_curr_feat)
         pair_curr_feat = pair_curr_feat * pair_curr_gate
 
         for i, p in enumerate(PAIRS):
             base, quote = PAIR_TO_CURR[p]
             bidx, qidx = CUR_IDX[base], CUR_IDX[quote]
             curr_sum[:, bidx] += pair_curr_feat[:, i]
-            curr_sum[:, qidx] -= pair_curr_feat[:, i]   # quote gets opposing info
+            curr_sum[:, qidx] -= pair_curr_feat[:, i]
             curr_cnt[:, bidx] += 1
             curr_cnt[:, qidx] += 1
 
@@ -323,16 +340,15 @@ class CurrencyAwareTrader(nn.Module):
         return curr_states, global_curr
 
     def forward(self, x: torch.Tensor):
-        # x: [B,S,N,F]
-        B, S, N, F = x.shape
-        shared_seq = x[:, :, 0, self.local_feat_dim:]   # shared features duplicated across nodes
-        shared_state = self.shared_encoder(shared_seq)   # [B, SHARED_DIM]
+        B, S, N, Fdim = x.shape
+        shared_seq = x[:, :, 0, self.local_feat_dim:]
+        shared_state = self.shared_encoder(shared_seq)
 
         local_states = []
         for i in range(N):
             loc_seq = x[:, :, i, :self.local_feat_dim]
             local_states.append(self.local_encoder(loc_seq))
-        pair_local = torch.stack(local_states, dim=1)    # [B,N,LOCAL_DIM]
+        pair_local = torch.stack(local_states, dim=1)
 
         curr_states, global_curr = self.build_currency_states(pair_local, shared_state)
 
@@ -345,14 +361,17 @@ class CurrencyAwareTrader(nn.Module):
                 curr_states[:, qidx],
                 curr_states[:, bidx] - curr_states[:, qidx],
             ], dim=-1)
-            sh = shared_state
-            feat = torch.cat([pair_local[:, i], sh, pair_currency], dim=-1)
+            feat = torch.cat([pair_local[:, i], shared_state, pair_currency], dim=-1)
             pair_feats.append(feat)
-        pair_feats = torch.stack(pair_feats, dim=1)   # [B,N,*]
+        pair_feats = torch.stack(pair_feats, dim=1)
 
         h = self.pair_mixer(pair_feats)
-        edge_logits = self.edge_head(h)               # [B,N,1]
-        dir_logits  = self.dir_head(h)                # [B,N,1]
+        global_ctx = self.global_pair_proj(global_curr).unsqueeze(1).expand(-1, N, -1)
+        attn_out, _ = self.cross_pair_attn(h + global_ctx, h + global_ctx, h, need_weights=False)
+        h = self.post_pair(h + attn_out)
+
+        edge_logits = self.edge_head(h)
+        dir_logits  = self.dir_head(h)
         gate = torch.sigmoid(edge_logits)
         direction = torch.tanh(dir_logits)
         size = torch.sigmoid(self.size_head(h)) * self.max_size
@@ -464,6 +483,9 @@ class TraderFirstLoss(nn.Module):
 # ============================================================
 def _find_dataset() -> str:
     candidates = [
+        '/kaggle/working/Titan15M_Dataset.csv',
+        '/kaggle/input/titanfx/Titan15M_Dataset.csv',
+        './Titan15M_Dataset.csv',
         '/kaggle/working/Titan30M_Dataset.csv',
         '/kaggle/input/titanfx/Titan30M_Dataset.csv',
         './Titan30M_Dataset.csv',
@@ -667,7 +689,7 @@ def evaluate(model, loader, criterion, device):
 # ============================================================
 def main():
     print("\n" + "=" * 60)
-    print("TITAN-NL v7.0: Trader-First / Currency-Aware / Ledger-First")
+    print("TITAN-NL v7.5: Trader-First / Currency-Aware / Multi-Scale 15m")
     print("=" * 60)
 
     dataset_path = _find_dataset()
@@ -713,7 +735,7 @@ def main():
 
     best_val = float('inf')
     patience_ctr = 0
-    save_name = 'Best_TITAN_V7_EXPLORATION.pth' if EXPLORATION_ONLY else 'Best_TITAN_V7.pth'
+    save_name = 'Best_TITAN_V75_EXPLORATION.pth' if EXPLORATION_ONLY else 'Best_TITAN_V75.pth'
 
     print(f"\n{'='*60}")
     print(f"PHASE 1: Historical Calibration ({EPOCHS} epochs)")
@@ -802,10 +824,10 @@ def main():
             'feats_per_node': feats_per_node,
             'max_hold': MAX_HOLD,
             'chunk_len': CHUNK_LEN,
-            'version': 'v7.0',
+            'version': 'v7.5',
         }
     }, 'titan_v7_complete.pth')
-    print("\nSaved `Best_TITAN_V7_EXPLORATION.pth` / `titan_v7_complete.pth` / `titan_scaler.pkl` / `titan_feature_schema.json`.")
+    print("\nSaved `Best_TITAN_V75_EXPLORATION.pth` / `titan_v7_complete.pth` / `titan_scaler.pkl` / `titan_feature_schema.json`.")
 
 
 if __name__ == '__main__':
