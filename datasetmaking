@@ -1,0 +1,665 @@
+import time, os, sys, io
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# ── Config ────────────────────────────────────────────────────────────────────
+HERE        = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
+OUT_PATH    = os.path.join(HERE, 'Titan30M_Dataset.csv')
+SLEEP_SEC   = 0.8
+MAX_RETRIES = 3
+
+END_DATE    = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+START_DATE  = END_DATE - timedelta(days=365)
+RECENT_DATE = END_DATE - timedelta(days=57)   # true 30m window from Yahoo
+
+FOREX_TICKERS = {
+    'EURUSD': 'EURUSD=X',
+    'GBPUSD': 'GBPUSD=X',
+    'USDJPY': 'USDJPY=X',
+    'AUDUSD': 'AUDUSD=X',
+}
+
+# 1h macro proxies we can safely pull over the same horizon
+MACRO_1H = {
+    'oil':    'CL=F',
+    'gold':   'GC=F',
+    'copper': 'HG=F',
+    'sp500':  '^GSPC',
+    'dxy':    'DX-Y.NYB',
+}
+
+# 1d macro proxies; daily will be forward-filled onto the 30m grid
+MACRO_1D = {
+    'vix':      '^VIX',
+    'yield10y': '^TNX',
+    'yield3m':  '^IRX',
+    'nikkei':   '^N225',
+    # practical free proxy for short-end U.S. rates when a clean 2Y yield series is unavailable
+    'ust2y_fut': '^USTTWO',
+}
+
+# Optional external daily geopolitics dataset (Kaggle/local).
+# We shift all of its daily values by 1 day before merging to intraday bars to avoid
+# leaking "today's daily close/event label" into earlier 30m bars.
+EXTERNAL_GEO_DAILY_CANDIDATES = [
+    os.path.join(HERE, 'oil_geopolitics_dataset_2010_2026.csv'),
+    '/kaggle/input/datasets/kavyadhyani/global-oil-prices-and-geopolitical-events/oil_geopolitics_dataset_2010_2026.csv',
+    '/kaggle/input/global-oil-prices-and-geopolitical-events/oil_geopolitics_dataset_2010_2026.csv',
+]
+
+EXTERNAL_GEO_TIMELINE_CANDIDATES = [
+    os.path.join(HERE, 'geopolitical_events_timeline.csv'),
+    '/kaggle/input/datasets/kavyadhyani/global-oil-prices-and-geopolitical-events/geopolitical_events_timeline.csv',
+    '/kaggle/input/global-oil-prices-and-geopolitical-events/geopolitical_events_timeline.csv',
+]
+
+# ── Download helper ───────────────────────────────────────────────────────────
+def dl(ticker, start, end, interval, retries=MAX_RETRIES):
+    fmt = '%Y-%m-%d'
+    for at in range(1, retries + 1):
+        try:
+            raw = yf.download(
+                ticker,
+                start=start.strftime(fmt),
+                end=end.strftime(fmt),
+                interval=interval,
+                progress=False,
+                auto_adjust=True,
+                threads=False,
+            )
+            if not raw.empty:
+                if raw.index.tz is not None:
+                    raw.index = raw.index.tz_convert('UTC').tz_localize(None)
+                else:
+                    raw.index = pd.to_datetime(raw.index).tz_localize(None)
+                raw = raw.sort_index()
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = [c[0] for c in raw.columns]
+                return raw
+        except Exception as e:
+            print(f"    [attempt {at}] {ticker} {interval}: {e}")
+            if at < retries:
+                time.sleep(4 * at)
+    return pd.DataFrame()
+
+
+def get_col(df, names, default=None):
+    for name in names:
+        if name in df.columns:
+            return df[name]
+    if default is not None:
+        return pd.Series(default, index=df.index)
+    return pd.Series(index=df.index, dtype='float64')
+
+
+def get_close(df):
+    return get_col(df, ['Close', 'close'])
+
+
+# ── Synthetic 1h -> 30m conversion ────────────────────────────────────────────
+def explode_1h_to_30m(df_1h: pd.DataFrame) -> pd.DataFrame:
+    """
+    Creates two synthetic 30m bars from each 1h bar.
+
+    Important:
+      We DO NOT inject the parent 1h High/Low into both child bars.
+      That would teach fake intrabar barrier hits. Instead, we use a muted open→mid and
+      mid→close path, while preserving the parent hourly range in separate features.
+    """
+    if df_1h.empty:
+        return pd.DataFrame()
+
+    out = []
+    for ts, row in df_1h.iterrows():
+        o = float(row['Open'])
+        h = float(row['High'])
+        l = float(row['Low'])
+        c = float(row['Close'])
+        mid = (o + c) / 2.0
+        parent_range = max(h - l, 0.0)
+
+        first = {
+            'Open': o,
+            'High': max(o, mid),
+            'Low': min(o, mid),
+            'Close': mid,
+            'Volume': np.nan,
+            'is_true_30m': 0.0,
+            'parent_range_1h': parent_range,
+            'parent_body_1h': abs(c - o),
+        }
+        second = {
+            'Open': mid,
+            'High': max(mid, c),
+            'Low': min(mid, c),
+            'Close': c,
+            'Volume': np.nan,
+            'is_true_30m': 0.0,
+            'parent_range_1h': parent_range,
+            'parent_body_1h': abs(c - o),
+        }
+        out.append((ts, first))
+        out.append((ts + pd.Timedelta(minutes=30), second))
+
+    out_df = pd.DataFrame([r for _, r in out], index=[i for i, _ in out]).sort_index()
+    return out_df
+
+
+# ── Feature helpers ───────────────────────────────────────────────────────────
+def safe_logret(series, lag=1):
+    s = series.replace(0, np.nan).ffill()
+    return np.log(s / s.shift(lag)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def rolling_zscore(series, window=96):
+    mu = series.rolling(window).mean()
+    sd = series.rolling(window).std().replace(0, np.nan)
+    return ((series - mu) / (sd + 1e-10)).clip(-8, 8).fillna(0.0)
+
+
+def compute_rsi(close, period=14):
+    delta = close.diff()
+    gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+    loss  = (-delta.clip(upper=0)).ewm(com=period - 1, adjust=False).mean()
+    rs    = gain / (loss + 1e-10)
+    return (100 - 100 / (1 + rs)).fillna(50.0)
+
+
+def compute_atr(high, low, close, period=14):
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(com=period - 1, adjust=False).mean().fillna(0.0)
+
+
+def compute_macd_hist(close, fast=12, slow=26, sig=9):
+    ema_f = close.ewm(span=fast, adjust=False).mean()
+    ema_s = close.ewm(span=slow, adjust=False).mean()
+    macd  = ema_f - ema_s
+    sig_l = macd.ewm(span=sig, adjust=False).mean()
+    return (macd - sig_l).fillna(0.0)
+
+
+def trend_efficiency(close, lookback=16):
+    net   = (close - close.shift(lookback)).abs()
+    gross = close.diff().abs().rolling(lookback).sum()
+    return (net / (gross + 1e-10)).clip(0, 1).fillna(0.0)
+
+
+def bars_since_sign_flip(ret_series, scale=8.0):
+    signs = np.sign(ret_series.replace(0, np.nan).ffill().fillna(0.0).values)
+    out = np.zeros(len(signs), dtype=np.float32)
+    ctr = 0
+    for i in range(len(signs)):
+        if i == 0 or signs[i] == signs[i - 1]:
+            ctr += 1
+        else:
+            ctr = 1
+        out[i] = np.tanh(ctr / scale)
+    return pd.Series(out, index=ret_series.index)
+
+
+def add_time_features(df):
+    idx = df.index
+    hour_float = idx.hour + idx.minute / 60.0
+    dow = idx.dayofweek.astype(float)
+
+    df['hour_sin'] = np.sin(2 * np.pi * hour_float / 24.0).astype('float32')
+    df['hour_cos'] = np.cos(2 * np.pi * hour_float / 24.0).astype('float32')
+    df['dow_sin']  = np.sin(2 * np.pi * dow / 7.0).astype('float32')
+    df['dow_cos']  = np.cos(2 * np.pi * dow / 7.0).astype('float32')
+
+    df['is_monday']     = (idx.dayofweek == 0).astype('float32')
+    df['is_friday']     = (idx.dayofweek == 4).astype('float32')
+    df['is_month_end']  = idx.is_month_end.astype('float32')
+    df['is_month_start']= idx.is_month_start.astype('float32')
+
+    london = ((hour_float >= 7.0) & (hour_float < 16.0)).astype(np.float32)
+    newyork = ((hour_float >= 13.0) & (hour_float < 22.0)).astype(np.float32)
+    asia = (((hour_float >= 0.0) & (hour_float < 9.0))).astype(np.float32)
+    overlap = ((hour_float >= 13.0) & (hour_float < 16.0)).astype(np.float32)
+
+    df['session_asia']    = asia
+    df['session_london']  = london
+    df['session_newyork'] = newyork
+    df['session_overlap'] = overlap
+    return df
+
+
+def first_bar_after_gap(index, min_gap_hours=8):
+    delta_hours = pd.Series(index).diff().dt.total_seconds().div(3600).fillna(0.0)
+    return (delta_hours >= min_gap_hours).astype(np.float32).values
+
+
+def find_first_existing(paths):
+    for p in paths:
+        if p and os.path.exists(p):
+            return p
+    return None
+
+
+def _normalize_event_type(val):
+    s = str(val).strip().lower()
+    if s in ('', 'nan', 'none', 'no_event', 'null'):
+        return 'none'
+    for old, new in [('/', '_'), (' ', '_'), ('-', '_'), ('&', 'and')]:
+        s = s.replace(old, new)
+    s = ''.join(ch for ch in s if ch.isalnum() or ch == '_')
+    return s or 'none'
+
+
+def load_external_geo_daily(main_path=None, timeline_path=None):
+    """
+    Load optional daily geopolitics/oil dataset and convert it to leak-safe daily features.
+    Every daily field is shifted by 1 day before intraday expansion.
+    """
+    if main_path is None:
+        main_path = find_first_existing(EXTERNAL_GEO_DAILY_CANDIDATES)
+    if timeline_path is None:
+        timeline_path = find_first_existing(EXTERNAL_GEO_TIMELINE_CANDIDATES)
+
+    if main_path is None:
+        return pd.DataFrame()
+
+    print(f"\n>>> Loading external daily geopolitics data ...")
+    print(f"  main file: {main_path}")
+    raw = pd.read_csv(main_path)
+    if 'date' not in raw.columns:
+        print("  [WARN] external file has no 'date' column; skipping.")
+        return pd.DataFrame()
+
+    raw['date'] = pd.to_datetime(raw['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
+    raw = raw.dropna(subset=['date']).sort_values('date').drop_duplicates('date', keep='last')
+    raw = raw.set_index('date')
+
+    out = pd.DataFrame(index=raw.index)
+
+    numeric_candidates = [
+        'brent_price', 'wti_price', 'dxy_index', 'vix', 'gpr_index',
+        'brent_return', 'wti_return', 'brent_wti_spread',
+        'brent_volatility_7d', 'brent_volatility_30d',
+        'wti_volatility_7d', 'wti_volatility_30d'
+    ]
+    for col in numeric_candidates:
+        if col in raw.columns:
+            out[f'geo_{col}'] = pd.to_numeric(raw[col], errors='coerce')
+
+    if 'event_flag' in raw.columns:
+        out['geo_event_flag'] = pd.to_numeric(raw['event_flag'], errors='coerce').fillna(0.0).clip(lower=0)
+
+    if 'event_severity' in raw.columns:
+        sev = raw['event_severity']
+        if pd.api.types.is_numeric_dtype(sev):
+            out['geo_event_severity'] = pd.to_numeric(sev, errors='coerce').fillna(0.0)
+        else:
+            sev_map = {
+                'none': 0.0, 'low': 1.0, 'minor': 1.0, 'moderate': 2.0,
+                'medium': 2.0, 'high': 3.0, 'severe': 4.0, 'critical': 5.0
+            }
+            out['geo_event_severity'] = sev.astype(str).str.lower().map(sev_map).fillna(0.0)
+
+    if 'event_type' in raw.columns:
+        evt = raw['event_type'].map(_normalize_event_type)
+        common = evt[evt != 'none'].value_counts().head(6).index.tolist()
+        out['geo_event_type_known'] = (evt != 'none').astype(float)
+        for ev in common:
+            out[f'geo_evt_{ev}'] = (evt == ev).astype(float)
+
+    # Optional extra event timeline: daily counts by type
+    if timeline_path is not None and os.path.exists(timeline_path):
+        try:
+            tl = pd.read_csv(timeline_path)
+            if 'date' in tl.columns:
+                tl['date'] = pd.to_datetime(tl['date'], errors='coerce').dt.tz_localize(None).dt.normalize()
+                tl = tl.dropna(subset=['date']).sort_values('date')
+                if 'event_type' in tl.columns:
+                    tl['event_type'] = tl['event_type'].map(_normalize_event_type)
+                    top_tl = tl[tl['event_type'] != 'none']['event_type'].value_counts().head(4).index.tolist()
+                    per_day = pd.DataFrame(index=out.index)
+                    per_day['geo_timeline_event_count'] = tl.groupby('date').size().reindex(out.index).fillna(0.0)
+                    for ev in top_tl:
+                        per_day[f'geo_tl_{ev}'] = (tl[tl['event_type'] == ev].groupby('date').size()
+                                                   .reindex(out.index).fillna(0.0).clip(upper=1.0))
+                    out = out.join(per_day, how='left')
+        except Exception as e:
+            print(f"  [WARN] failed to parse timeline file: {e}")
+
+    # Shift all daily info by 1 full day for leak safety.
+    out = out.shift(1)
+
+    # Derived daily-regime features
+    if 'geo_event_flag' in out.columns:
+        ef = out['geo_event_flag'].fillna(0.0)
+        out['geo_event_recent_3d'] = (ef.rolling(3, min_periods=1).max() > 0).astype(float)
+        out['geo_event_recent_7d'] = (ef.rolling(7, min_periods=1).max() > 0).astype(float)
+        out['geo_event_count_7d']  = ef.rolling(7, min_periods=1).sum().clip(0, 7)
+
+    if 'geo_event_severity' in out.columns:
+        out['geo_event_severity_7d'] = out['geo_event_severity'].fillna(0.0).rolling(7, min_periods=1).mean()
+
+    for col in ['geo_gpr_index', 'geo_brent_return', 'geo_wti_return', 'geo_brent_wti_spread',
+                'geo_brent_volatility_7d', 'geo_brent_volatility_30d',
+                'geo_wti_volatility_7d', 'geo_wti_volatility_30d']:
+        if col in out.columns:
+            out[f'{col}_z30'] = rolling_zscore(out[col].ffill().bfill(), 30)
+
+    # Composite stress scores from the external daily dataset
+    gpr_part  = out.get('geo_gpr_index_z30', 0.0)
+    evt_part  = out.get('geo_event_recent_7d', 0.0)
+    sev_part  = out.get('geo_event_severity_7d', 0.0)
+    oil_part  = out.get('geo_brent_return_z30', 0.0)
+    vol_part  = out.get('geo_brent_volatility_7d_z30', 0.0)
+
+    out['geo_conflict_score'] = (0.45 * gpr_part + 0.25 * evt_part + 0.15 * sev_part + 0.15 * vol_part)
+    out['geo_oilshock_score'] = (0.60 * oil_part + 0.40 * vol_part)
+
+    out.replace([np.inf, -np.inf], np.nan, inplace=True)
+    out = out.ffill().bfill().fillna(0.0).astype('float32')
+    print(f"  external daily features: {out.shape[1]} cols across {len(out)} days")
+    return out
+
+
+def align_daily_to_intraday(daily_df, intraday_index):
+    if daily_df is None or daily_df.empty:
+        return pd.DataFrame(index=intraday_index)
+    aligned = daily_df.reindex(pd.DatetimeIndex(intraday_index.normalize()), method='ffill')
+    aligned.index = intraday_index
+    return aligned
+
+
+print(f"\n{'='*60}")
+print("Titan 30M Dataset Builder  v4")
+print(f"Full year : {START_DATE.date()} -> {END_DATE.date()}")
+print(f"True 30m  : {RECENT_DATE.date()} -> {END_DATE.date()}  (~57 days)")
+print(f"{'='*60}\n")
+
+# ── Step 1: forex downloads ───────────────────────────────────────────────────
+print(">>> [1/5] Downloading forex 1h for full year ...")
+forex_1h = {}
+for name, ticker in FOREX_TICKERS.items():
+    raw = dl(ticker, START_DATE, END_DATE, '1h')
+    forex_1h[name] = raw
+    print(f"  [{name}] {len(raw)} 1h bars" if not raw.empty else f"  [{name}] EMPTY")
+    time.sleep(SLEEP_SEC)
+
+print("\n>>> [2/5] Downloading true 30m forex (recent window) ...")
+forex_30m = {}
+for name, ticker in FOREX_TICKERS.items():
+    raw = dl(ticker, RECENT_DATE, END_DATE, '30m')
+    forex_30m[name] = raw
+    print(f"  [{name}] {len(raw)} 30m bars" if not raw.empty else f"  [{name}] EMPTY")
+    time.sleep(SLEEP_SEC)
+
+# ── Step 2: macro downloads ───────────────────────────────────────────────────
+print("\n>>> [3/5] Downloading macro 1h ...")
+macro_1h = {}
+for name, ticker in MACRO_1H.items():
+    raw = dl(ticker, START_DATE, END_DATE, '1h')
+    macro_1h[name] = get_close(raw) if not raw.empty else pd.Series(dtype='float64')
+    print(f"  [{name}] {len(raw)} 1h bars" if not raw.empty else f"  [{name}] EMPTY")
+    time.sleep(SLEEP_SEC)
+
+print("\n>>> [4/5] Downloading macro 1d ...")
+macro_1d = {}
+for name, ticker in MACRO_1D.items():
+    raw = dl(ticker, START_DATE, END_DATE, '1d')
+    macro_1d[name] = get_close(raw) if not raw.empty else pd.Series(dtype='float64')
+    print(f"  [{name}] {len(raw)} daily bars" if not raw.empty else f"  [{name}] EMPTY")
+    time.sleep(SLEEP_SEC)
+
+external_geo_daily = load_external_geo_daily()
+
+# ── Step 3: master grid ───────────────────────────────────────────────────────
+print("\n>>> [5/5] Building master 30m grid ...")
+all_idx = []
+for name in FOREX_TICKERS:
+    if not forex_1h[name].empty:
+        all_idx.extend(explode_1h_to_30m(forex_1h[name]).index.tolist())
+    if not forex_30m[name].empty:
+        all_idx.extend(forex_30m[name].index.tolist())
+
+if not all_idx:
+    raise RuntimeError("No forex data downloaded. Cannot build dataset.")
+
+master_idx = pd.DatetimeIndex(sorted(pd.Index(all_idx).unique()))
+final = pd.DataFrame(index=master_idx)
+final.index.name = 'datetime'
+print(f"  Master grid: {len(final)} bars  ({final.index[0]} -> {final.index[-1]})")
+
+# ── Assemble forex OHLC + quality flags ──────────────────────────────────────
+for pair in FOREX_TICKERS:
+    base_1h = forex_1h.get(pair, pd.DataFrame())
+    synth = explode_1h_to_30m(base_1h)
+
+    for col in ['Open', 'High', 'Low', 'Close']:
+        final[f'{pair}_{col}'] = synth[col].reindex(final.index) if not synth.empty else np.nan
+
+    final[f'{pair}_is_true30m']   = synth['is_true_30m'].reindex(final.index).fillna(0.0) if not synth.empty else 0.0
+    final[f'{pair}_parent_rng1h'] = synth['parent_range_1h'].reindex(final.index).fillna(0.0) if not synth.empty else 0.0
+    final[f'{pair}_parent_bdy1h'] = synth['parent_body_1h'].reindex(final.index).fillna(0.0) if not synth.empty else 0.0
+
+    true30 = forex_30m.get(pair, pd.DataFrame())
+    if not true30.empty:
+        for col in ['Open', 'High', 'Low', 'Close']:
+            if col in true30.columns:
+                overlay = true30[col].reindex(final.index)
+                mask = overlay.notna()
+                final.loc[mask, f'{pair}_{col}'] = overlay[mask].values
+        true_mask = true30['Close'].reindex(final.index).notna().astype(np.float32)
+        final.loc[true_mask.index, f'{pair}_is_true30m'] = np.maximum(final[f'{pair}_is_true30m'].values, true_mask.values)
+
+    for col in ['Open', 'High', 'Low', 'Close']:
+        final[f'{pair}_{col}'] = final[f'{pair}_{col}'].ffill(limit=6)
+
+    valid = final[f'{pair}_Close'].notna().sum()
+    pct_true = final[f'{pair}_is_true30m'].mean() * 100
+    print(f"  [{pair}] {valid}/{len(final)} bars filled | true30m={pct_true:.1f}%")
+
+# drop rows where no pair has price
+forex_close_cols = [f'{p}_Close' for p in FOREX_TICKERS]
+final.dropna(subset=forex_close_cols, how='all', inplace=True)
+
+# mark first bar after long calendar gap
+final['after_gap_8h'] = first_bar_after_gap(final.index, min_gap_hours=8)
+final = add_time_features(final)
+
+# ── Macro align + transform ───────────────────────────────────────────────────
+for name, series in macro_1h.items():
+    col = f'{name}_close'
+    if series.empty:
+        final[col] = 0.0
+    else:
+        final[col] = series.reindex(final.index).ffill().bfill().fillna(0.0)
+
+for name, series in macro_1d.items():
+    col = f'{name}_close'
+    if series.empty:
+        final[col] = 0.0
+    else:
+        final[col] = series.reindex(final.index, method='ffill').bfill().fillna(0.0)
+
+# daily rates / index transforms
+for base in list(MACRO_1H.keys()) + list(MACRO_1D.keys()):
+    col = f'{base}_close'
+    s = final[col].replace(0, np.nan).ffill().bfill()
+    final[f'{base}_ret1']  = safe_logret(s, 1).astype('float32')
+    final[f'{base}_ret4']  = safe_logret(s, 4).astype('float32')
+    final[f'{base}_ret16'] = safe_logret(s, 16).astype('float32')
+    final[f'{base}_z96']   = rolling_zscore(final[f'{base}_ret1'], 96).astype('float32')
+
+# yield features (important to keep as changes, not log returns only)
+for y in ['yield10y_close', 'yield3m_close', 'ust2y_fut_close']:
+    if y in final.columns:
+        final[f'{y}_chg1'] = final[y].diff().fillna(0.0).astype('float32')
+        final[f'{y}_chg4'] = final[y].diff(4).fillna(0.0).astype('float32')
+
+if 'yield10y_close' in final.columns and 'yield3m_close' in final.columns:
+    final['yield_curve_10y_3m'] = (final['yield10y_close'] - final['yield3m_close']).astype('float32')
+    final['yield_curve_10y_3m_z96'] = rolling_zscore(final['yield_curve_10y_3m'], 96).astype('float32')
+
+# cross-asset composite features
+final['riskoff_score'] = (
+    + 0.35 * final.get('dxy_z96', 0.0)
+    + 0.25 * final.get('vix_z96', 0.0)
+    + 0.20 * final.get('gold_z96', 0.0)
+    - 0.20 * final.get('sp500_z96', 0.0)
+    - 0.10 * final.get('nikkei_z96', 0.0)
+).astype('float32')
+
+final['energy_stress'] = (
+    0.65 * final.get('oil_z96', 0.0) + 0.35 * final.get('copper_z96', 0.0)
+).astype('float32')
+
+# Optional external daily geopolitics/oil regime features
+if external_geo_daily is not None and not external_geo_daily.empty:
+    geo_aligned = align_daily_to_intraday(external_geo_daily, final.index)
+    final = final.join(geo_aligned, how='left')
+    final['geo_available'] = 1.0
+else:
+    final['geo_available'] = 0.0
+
+if 'geo_conflict_score' in final.columns:
+    final['global_stress_score'] = (
+        0.50 * final['riskoff_score']
+        + 0.25 * final['energy_stress']
+        + 0.25 * final['geo_conflict_score']
+    ).astype('float32')
+else:
+    final['global_stress_score'] = (
+        0.65 * final['riskoff_score'] + 0.35 * final['energy_stress']
+    ).astype('float32')
+
+# ── Pair directional / microstructure features ───────────────────────────────
+print("\n>>> Computing pair-level features ...")
+for pair in FOREX_TICKERS:
+    o = final[f'{pair}_Open'].replace(0, np.nan).ffill()
+    h = final[f'{pair}_High'].replace(0, np.nan).ffill()
+    l = final[f'{pair}_Low'].replace(0, np.nan).ffill()
+    c = final[f'{pair}_Close'].replace(0, np.nan).ffill()
+
+    ret1  = safe_logret(c, 1)
+    ret2  = safe_logret(c, 2)
+    ret4  = safe_logret(c, 4)
+    ret8  = safe_logret(c, 8)
+    ret16 = safe_logret(c, 16)
+
+    range_raw  = (h - l).fillna(0.0)
+    body_raw   = (c - o).fillna(0.0)
+    upper_wick = (h - np.maximum(o, c)).clip(lower=0).fillna(0.0)
+    lower_wick = (np.minimum(o, c) - l).clip(lower=0).fillna(0.0)
+    close_pos  = ((c - l) / (range_raw + 1e-10)).clip(0, 1).fillna(0.5) - 0.5
+
+    atr14      = compute_atr(h, l, c, 14)
+    atr14n     = (atr14 / (c + 1e-10)).fillna(0.0)
+    vol10      = ret1.rolling(10).std().fillna(0.0)
+    vol20      = ret1.rolling(20).std().fillna(0.0)
+    range20    = range_raw.rolling(20).mean().fillna(0.0)
+    compress20 = (range_raw / (range20 + 1e-10)).clip(0, 10).fillna(1.0)
+
+    ema8  = c.ewm(span=8, adjust=False).mean()
+    ema21 = c.ewm(span=21, adjust=False).mean()
+    ema_gap = ((ema8 - ema21) / (atr14 + 1e-10)).fillna(0.0)
+
+    rsi14     = compute_rsi(c, 14) / 100.0 - 0.5
+    macdh     = compute_macd_hist(c)
+    eff16     = trend_efficiency(c, 16)
+    momage    = bars_since_sign_flip(ret1, scale=8.0)
+
+    hi20 = h.rolling(20).max()
+    lo20 = l.rolling(20).min()
+    dist_hi20 = ((c - hi20) / (atr14 + 1e-10)).fillna(0.0)
+    dist_lo20 = ((c - lo20) / (atr14 + 1e-10)).fillna(0.0)
+
+    final[f'{pair}_ret1']      = ret1.astype('float32')
+    final[f'{pair}_ret2']      = ret2.astype('float32')
+    final[f'{pair}_ret4']      = ret4.astype('float32')
+    final[f'{pair}_ret8']      = ret8.astype('float32')
+    final[f'{pair}_ret16']     = ret16.astype('float32')
+    final[f'{pair}_vol10']     = vol10.astype('float32')
+    final[f'{pair}_vol20']     = vol20.astype('float32')
+    final[f'{pair}_atr14raw']  = atr14.astype('float32')
+    final[f'{pair}_atr14n']    = atr14n.astype('float32')
+    final[f'{pair}_range_n']   = (range_raw / (c + 1e-10)).fillna(0.0).astype('float32')
+    final[f'{pair}_body_n']    = (body_raw / (atr14 + 1e-10)).fillna(0.0).astype('float32')
+    final[f'{pair}_upwick_n']  = (upper_wick / (atr14 + 1e-10)).fillna(0.0).astype('float32')
+    final[f'{pair}_dnwick_n']  = (lower_wick / (atr14 + 1e-10)).fillna(0.0).astype('float32')
+    final[f'{pair}_closepos']  = close_pos.astype('float32')
+    final[f'{pair}_compress20']= compress20.astype('float32')
+    final[f'{pair}_rsi14']     = rsi14.astype('float32')
+    final[f'{pair}_macdh']     = macdh.astype('float32')
+    final[f'{pair}_ema_gap']   = ema_gap.astype('float32')
+    final[f'{pair}_eff16']     = eff16.astype('float32')
+    final[f'{pair}_momage']    = momage.astype('float32')
+    final[f'{pair}_dist_hi20'] = dist_hi20.astype('float32')
+    final[f'{pair}_dist_lo20'] = dist_lo20.astype('float32')
+
+    # source-quality / synthetic-awareness features
+    final[f'{pair}_quality'] = (
+        0.25 + 0.75 * final[f'{pair}_is_true30m']
+    ).astype('float32')
+    final[f'{pair}_parent_rng1h_n'] = (
+        final[f'{pair}_parent_rng1h'] / (c + 1e-10)
+    ).fillna(0.0).astype('float32')
+    final[f'{pair}_parent_bdy1h_n'] = (
+        final[f'{pair}_parent_bdy1h'] / (c + 1e-10)
+    ).fillna(0.0).astype('float32')
+
+    # simple future-return targets for diagnostics / optional supervised heads
+    final[f'target_{pair}_ret_1']  = safe_logret(c.shift(-1), 0).astype('float32')
+    final[f'target_{pair}_ret_4']  = safe_logret(c.shift(-4), 0).astype('float32')
+    final[f'target_{pair}_ret_12'] = safe_logret(c.shift(-12), 0).astype('float32')
+
+    print(f"  [{pair}] ret1_std={ret1.std():.6f} | vol20_mean={vol20.mean():.6f} | true30m={final[f'{pair}_is_true30m'].mean()*100:.1f}%")
+
+# overwrite target calculations with proper future/log-return form
+for pair in FOREX_TICKERS:
+    c = final[f'{pair}_Close'].replace(0, np.nan).ffill()
+    for h in [1, 4, 12]:
+        final[f'target_{pair}_ret_{h}'] = np.log(c.shift(-h) / c).replace([np.inf, -np.inf], np.nan).fillna(0.0).astype('float32')
+
+# ── Currency-strength features ────────────────────────────────────────────────
+# Positive means currency strengthening.
+final['USD_strength_1'] = ((
+    -final['EURUSD_ret1'] - final['GBPUSD_ret1'] - final['AUDUSD_ret1'] + final['USDJPY_ret1']
+) / 4.0).astype('float32')
+final['USD_strength_4'] = ((
+    -final['EURUSD_ret4'] - final['GBPUSD_ret4'] - final['AUDUSD_ret4'] + final['USDJPY_ret4']
+) / 4.0).astype('float32')
+
+final['EUR_strength_1'] = final['EURUSD_ret1'].astype('float32')
+final['GBP_strength_1'] = final['GBPUSD_ret1'].astype('float32')
+final['AUD_strength_1'] = final['AUDUSD_ret1'].astype('float32')
+final['JPY_strength_1'] = (-final['USDJPY_ret1']).astype('float32')
+
+# pair dispersion / correlation proxies
+usd_pairs = ['EURUSD_ret1', 'GBPUSD_ret1', 'AUDUSD_ret1', 'USDJPY_ret1']
+final['usd_pair_dispersion_20'] = final[usd_pairs].std(axis=1).rolling(20).mean().fillna(0.0).astype('float32')
+final['fx_momentum_breadth'] = np.sign(final[usd_pairs]).mean(axis=1).fillna(0.0).astype('float32')
+
+# Cross links to current macro regime
+for pair in FOREX_TICKERS:
+    final[f'{pair}_x_riskoff'] = (final[f'{pair}_ret1'] * final['riskoff_score']).astype('float32')
+    final[f'{pair}_x_energy']  = (final[f'{pair}_ret1'] * final['energy_stress']).astype('float32')
+    final[f'{pair}_x_dxy']     = (final[f'{pair}_ret1'] * final.get('dxy_z96', 0.0)).astype('float32')
+    final[f'{pair}_x_gstress'] = (final[f'{pair}_ret1'] * final['global_stress_score']).astype('float32')
+
+# ── Final clean-up ────────────────────────────────────────────────────────────
+final.replace([np.inf, -np.inf], np.nan, inplace=True)
+final.ffill(inplace=True)
+final.bfill(inplace=True)
+final.fillna(0.0, inplace=True)
+final = final.astype('float32')
+
+print(f"\n  Final shape : {final.shape[0]} rows x {final.shape[1]} cols")
+print(f"  Date range  : {final.index[0]} -> {final.index[-1]}")
+print(f"  NaN count   : {int(final.isna().sum().sum())}")
+
+final.to_csv(OUT_PATH)
+print(f"\n  Saved -> {OUT_PATH}")
+print(f"\nTitan30M_Dataset.csv COMPLETE  ({final.shape[0]} 30m bars)")
+print(f"  External geo columns present: {sum(c.startswith('geo_') for c in final.columns)}")
