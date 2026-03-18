@@ -7,13 +7,14 @@ import yfinance as yf
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HERE        = os.path.dirname(os.path.abspath(__file__)) if '__file__' in dir() else os.getcwd()
-OUT_PATH    = os.path.join(HERE, 'Titan30M_Dataset.csv')
+OUT_PATH    = os.path.join(HERE, 'Titan15M_Dataset.csv')
 SLEEP_SEC   = 0.8
 MAX_RETRIES = 3
 
 END_DATE    = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 START_DATE  = END_DATE - timedelta(days=365)
-RECENT_DATE = END_DATE - timedelta(days=57)   # true 30m window from Yahoo
+RECENT_30M_DATE = END_DATE - timedelta(days=57)   # true 30m window from Yahoo
+RECENT_15M_DATE = END_DATE - timedelta(days=29)   # tighter 15m window to respect Yahoo limits
 
 FOREX_TICKERS = {
     'EURUSD': 'EURUSD=X',
@@ -31,7 +32,7 @@ MACRO_1H = {
     'dxy':    'DX-Y.NYB',
 }
 
-# 1d macro proxies; daily will be forward-filled onto the 30m grid
+# 1d macro proxies; daily will be forward-filled onto the 15m grid
 MACRO_1D = {
     'vix':      '^VIX',
     'yield10y': '^TNX',
@@ -43,7 +44,7 @@ MACRO_1D = {
 
 # Optional external daily geopolitics dataset (Kaggle/local).
 # We shift all of its daily values by 1 day before merging to intraday bars to avoid
-# leaking "today's daily close/event label" into earlier 30m bars.
+# leaking "today's daily close/event label" into earlier 15m bars.
 EXTERNAL_GEO_DAILY_CANDIDATES = [
     os.path.join(HERE, 'oil_geopolitics_dataset_2010_2026.csv'),
     '/kaggle/input/datasets/kavyadhyani/global-oil-prices-and-geopolitical-events/oil_geopolitics_dataset_2010_2026.csv',
@@ -99,15 +100,16 @@ def get_close(df):
     return get_col(df, ['Close', 'close'])
 
 
-# ── Synthetic 1h -> 30m conversion ────────────────────────────────────────────
-def explode_1h_to_30m(df_1h: pd.DataFrame) -> pd.DataFrame:
+# ── Synthetic 1h -> 15m conversion ────────────────────────────────────────────
+def explode_1h_to_15m(df_1h: pd.DataFrame) -> pd.DataFrame:
     """
-    Creates two synthetic 30m bars from each 1h bar.
+    Creates four synthetic 15m bars from each 1h bar.
 
     Important:
-      We DO NOT inject the parent 1h High/Low into both child bars.
-      That would teach fake intrabar barrier hits. Instead, we use a muted open→mid and
-      mid→close path, while preserving the parent hourly range in separate features.
+      We keep the intrabar path intentionally smooth so the training targets do not learn
+      impossible microstructure from hourly candles. Parent range/body are preserved as
+      separate context features, and true 30m / true 15m overlays replace these synthetic
+      bars whenever recent Yahoo windows are available.
     """
     if df_1h.empty:
         return pd.DataFrame()
@@ -118,31 +120,27 @@ def explode_1h_to_30m(df_1h: pd.DataFrame) -> pd.DataFrame:
         h = float(row['High'])
         l = float(row['Low'])
         c = float(row['Close'])
-        mid = (o + c) / 2.0
+        path = np.linspace(o, c, 5)
         parent_range = max(h - l, 0.0)
+        parent_body = abs(c - o)
 
-        first = {
-            'Open': o,
-            'High': max(o, mid),
-            'Low': min(o, mid),
-            'Close': mid,
-            'Volume': np.nan,
-            'is_true_30m': 0.0,
-            'parent_range_1h': parent_range,
-            'parent_body_1h': abs(c - o),
-        }
-        second = {
-            'Open': mid,
-            'High': max(mid, c),
-            'Low': min(mid, c),
-            'Close': c,
-            'Volume': np.nan,
-            'is_true_30m': 0.0,
-            'parent_range_1h': parent_range,
-            'parent_body_1h': abs(c - o),
-        }
-        out.append((ts, first))
-        out.append((ts + pd.Timedelta(minutes=30), second))
+        for step in range(4):
+            left = float(path[step])
+            right = float(path[step + 1])
+            out.append((
+                ts + pd.Timedelta(minutes=15 * step),
+                {
+                    'Open': left,
+                    'High': max(left, right),
+                    'Low': min(left, right),
+                    'Close': right,
+                    'Volume': np.nan,
+                    'is_true_30m': 0.0,
+                    'is_true_15m': 0.0,
+                    'parent_range_1h': parent_range,
+                    'parent_body_1h': parent_body,
+                }
+            ))
 
     out_df = pd.DataFrame([r for _, r in out], index=[i for i, _ in out]).sort_index()
     return out_df
@@ -202,6 +200,31 @@ def bars_since_sign_flip(ret_series, scale=8.0):
             ctr = 1
         out[i] = np.tanh(ctr / scale)
     return pd.Series(out, index=ret_series.index)
+
+def rolling_slope(series, window=16):
+    def _slope(vals):
+        vals = np.asarray(vals, dtype=np.float64)
+        if np.isnan(vals).any():
+            vals = pd.Series(vals).ffill().bfill().values
+        x = np.arange(len(vals), dtype=np.float64)
+        x = x - x.mean()
+        y = vals - np.nanmean(vals)
+        denom = np.dot(x, x)
+        return 0.0 if denom <= 0 else float(np.dot(x, y) / denom)
+    return series.rolling(window, min_periods=max(4, window // 3)).apply(_slope, raw=True).fillna(0.0)
+
+
+def realized_vol(close, window):
+    return safe_logret(close, 1).rolling(window).std().fillna(0.0)
+
+
+def add_cross_asset_lag_features(df, cols, prefix):
+    out = pd.DataFrame(index=df.index)
+    for lag in [1, 4, 16]:
+        lagged = df[cols].shift(lag)
+        out[f'{prefix}_lag{lag}_mean'] = lagged.mean(axis=1).fillna(0.0).astype('float32')
+        out[f'{prefix}_lag{lag}_disp'] = lagged.std(axis=1).fillna(0.0).astype('float32')
+    return out
 
 
 def add_time_features(df):
@@ -373,13 +396,14 @@ def align_daily_to_intraday(daily_df, intraday_index):
 
 
 print(f"\n{'='*60}")
-print("Titan 30M Dataset Builder  v4")
+print("Titan 15M Dataset Builder  v5")
 print(f"Full year : {START_DATE.date()} -> {END_DATE.date()}")
-print(f"True 30m  : {RECENT_DATE.date()} -> {END_DATE.date()}  (~57 days)")
+print(f"True 30m  : {RECENT_30M_DATE.date()} -> {END_DATE.date()}  (~57 days)")
+print(f"True 15m  : {RECENT_15M_DATE.date()} -> {END_DATE.date()}  (~29 days)")
 print(f"{'='*60}\n")
 
 # ── Step 1: forex downloads ───────────────────────────────────────────────────
-print(">>> [1/5] Downloading forex 1h for full year ...")
+print(">>> [1/6] Downloading forex 1h for full year ...")
 forex_1h = {}
 for name, ticker in FOREX_TICKERS.items():
     raw = dl(ticker, START_DATE, END_DATE, '1h')
@@ -387,16 +411,24 @@ for name, ticker in FOREX_TICKERS.items():
     print(f"  [{name}] {len(raw)} 1h bars" if not raw.empty else f"  [{name}] EMPTY")
     time.sleep(SLEEP_SEC)
 
-print("\n>>> [2/5] Downloading true 30m forex (recent window) ...")
+print("\n>>> [2/6] Downloading true 30m forex (recent window) ...")
 forex_30m = {}
 for name, ticker in FOREX_TICKERS.items():
-    raw = dl(ticker, RECENT_DATE, END_DATE, '30m')
+    raw = dl(ticker, RECENT_30M_DATE, END_DATE, '30m')
     forex_30m[name] = raw
     print(f"  [{name}] {len(raw)} 30m bars" if not raw.empty else f"  [{name}] EMPTY")
     time.sleep(SLEEP_SEC)
 
+print("\n>>> [3/6] Downloading true 15m forex (tight recent window) ...")
+forex_15m = {}
+for name, ticker in FOREX_TICKERS.items():
+    raw = dl(ticker, RECENT_15M_DATE, END_DATE, '15m')
+    forex_15m[name] = raw
+    print(f"  [{name}] {len(raw)} 15m bars" if not raw.empty else f"  [{name}] EMPTY")
+    time.sleep(SLEEP_SEC)
+
 # ── Step 2: macro downloads ───────────────────────────────────────────────────
-print("\n>>> [3/5] Downloading macro 1h ...")
+print("\n>>> [4/6] Downloading macro 1h ...")
 macro_1h = {}
 for name, ticker in MACRO_1H.items():
     raw = dl(ticker, START_DATE, END_DATE, '1h')
@@ -404,7 +436,7 @@ for name, ticker in MACRO_1H.items():
     print(f"  [{name}] {len(raw)} 1h bars" if not raw.empty else f"  [{name}] EMPTY")
     time.sleep(SLEEP_SEC)
 
-print("\n>>> [4/5] Downloading macro 1d ...")
+print("\n>>> [5/6] Downloading macro 1d ...")
 macro_1d = {}
 for name, ticker in MACRO_1D.items():
     raw = dl(ticker, START_DATE, END_DATE, '1d')
@@ -415,13 +447,15 @@ for name, ticker in MACRO_1D.items():
 external_geo_daily = load_external_geo_daily()
 
 # ── Step 3: master grid ───────────────────────────────────────────────────────
-print("\n>>> [5/5] Building master 30m grid ...")
+print("\n>>> [6/6] Building master 15m grid ...")
 all_idx = []
 for name in FOREX_TICKERS:
     if not forex_1h[name].empty:
-        all_idx.extend(explode_1h_to_30m(forex_1h[name]).index.tolist())
+        all_idx.extend(explode_1h_to_15m(forex_1h[name]).index.tolist())
     if not forex_30m[name].empty:
         all_idx.extend(forex_30m[name].index.tolist())
+    if not forex_15m[name].empty:
+        all_idx.extend(forex_15m[name].index.tolist())
 
 if not all_idx:
     raise RuntimeError("No forex data downloaded. Cannot build dataset.")
@@ -434,12 +468,13 @@ print(f"  Master grid: {len(final)} bars  ({final.index[0]} -> {final.index[-1]}
 # ── Assemble forex OHLC + quality flags ──────────────────────────────────────
 for pair in FOREX_TICKERS:
     base_1h = forex_1h.get(pair, pd.DataFrame())
-    synth = explode_1h_to_30m(base_1h)
+    synth = explode_1h_to_15m(base_1h)
 
     for col in ['Open', 'High', 'Low', 'Close']:
         final[f'{pair}_{col}'] = synth[col].reindex(final.index) if not synth.empty else np.nan
 
     final[f'{pair}_is_true30m']   = synth['is_true_30m'].reindex(final.index).fillna(0.0) if not synth.empty else 0.0
+    final[f'{pair}_is_true15m']   = synth['is_true_15m'].reindex(final.index).fillna(0.0) if not synth.empty else 0.0
     final[f'{pair}_parent_rng1h'] = synth['parent_range_1h'].reindex(final.index).fillna(0.0) if not synth.empty else 0.0
     final[f'{pair}_parent_bdy1h'] = synth['parent_body_1h'].reindex(final.index).fillna(0.0) if not synth.empty else 0.0
 
@@ -453,12 +488,24 @@ for pair in FOREX_TICKERS:
         true_mask = true30['Close'].reindex(final.index).notna().astype(np.float32)
         final.loc[true_mask.index, f'{pair}_is_true30m'] = np.maximum(final[f'{pair}_is_true30m'].values, true_mask.values)
 
+    true15 = forex_15m.get(pair, pd.DataFrame())
+    if not true15.empty:
+        for col in ['Open', 'High', 'Low', 'Close']:
+            if col in true15.columns:
+                overlay = true15[col].reindex(final.index)
+                mask = overlay.notna()
+                final.loc[mask, f'{pair}_{col}'] = overlay[mask].values
+        true15_mask = true15['Close'].reindex(final.index).notna().astype(np.float32)
+        final.loc[true15_mask.index, f'{pair}_is_true15m'] = np.maximum(final[f'{pair}_is_true15m'].values, true15_mask.values)
+        final.loc[true15_mask.index, f'{pair}_is_true30m'] = np.maximum(final[f'{pair}_is_true30m'].values, true15_mask.values)
+
     for col in ['Open', 'High', 'Low', 'Close']:
         final[f'{pair}_{col}'] = final[f'{pair}_{col}'].ffill(limit=6)
 
     valid = final[f'{pair}_Close'].notna().sum()
-    pct_true = final[f'{pair}_is_true30m'].mean() * 100
-    print(f"  [{pair}] {valid}/{len(final)} bars filled | true30m={pct_true:.1f}%")
+    pct_true30 = final[f'{pair}_is_true30m'].mean() * 100
+    pct_true15 = final[f'{pair}_is_true15m'].mean() * 100
+    print(f"  [{pair}] {valid}/{len(final)} bars filled | true15m={pct_true15:.1f}% | true30m={pct_true30:.1f}%")
 
 # drop rows where no pair has price
 forex_close_cols = [f'{p}_Close' for p in FOREX_TICKERS]
@@ -547,6 +594,8 @@ for pair in FOREX_TICKERS:
     ret4  = safe_logret(c, 4)
     ret8  = safe_logret(c, 8)
     ret16 = safe_logret(c, 16)
+    ret32 = safe_logret(c, 32)
+    ret64 = safe_logret(c, 64)
 
     range_raw  = (h - l).fillna(0.0)
     body_raw   = (c - o).fillna(0.0)
@@ -558,30 +607,50 @@ for pair in FOREX_TICKERS:
     atr14n     = (atr14 / (c + 1e-10)).fillna(0.0)
     vol10      = ret1.rolling(10).std().fillna(0.0)
     vol20      = ret1.rolling(20).std().fillna(0.0)
+    vol_fast   = realized_vol(c, 8)
+    vol_medium = realized_vol(c, 24)
+    vol_slow   = realized_vol(c, 96)
+    vol_ratio_fast_slow = (vol_fast / (vol_slow + 1e-10)).clip(0, 10).fillna(1.0)
     range20    = range_raw.rolling(20).mean().fillna(0.0)
     compress20 = (range_raw / (range20 + 1e-10)).clip(0, 10).fillna(1.0)
 
     ema8  = c.ewm(span=8, adjust=False).mean()
     ema21 = c.ewm(span=21, adjust=False).mean()
+    ema55 = c.ewm(span=55, adjust=False).mean()
     ema_gap = ((ema8 - ema21) / (atr14 + 1e-10)).fillna(0.0)
+    trend_stack = ((ema8 - ema55) / (atr14 + 1e-10)).fillna(0.0)
 
     rsi14     = compute_rsi(c, 14) / 100.0 - 0.5
     macdh     = compute_macd_hist(c)
     eff16     = trend_efficiency(c, 16)
+    eff48     = trend_efficiency(c, 48)
     momage    = bars_since_sign_flip(ret1, scale=8.0)
+    slope16   = rolling_slope(c, 16) / (atr14 + 1e-10)
+    slope48   = rolling_slope(c, 48) / (atr14 + 1e-10)
 
     hi20 = h.rolling(20).max()
     lo20 = l.rolling(20).min()
+    hi96 = h.rolling(96).max()
+    lo96 = l.rolling(96).min()
     dist_hi20 = ((c - hi20) / (atr14 + 1e-10)).fillna(0.0)
     dist_lo20 = ((c - lo20) / (atr14 + 1e-10)).fillna(0.0)
+    dist_hi96 = ((c - hi96) / (atr14 + 1e-10)).fillna(0.0)
+    dist_lo96 = ((c - lo96) / (atr14 + 1e-10)).fillna(0.0)
+    breakout_96 = ((c > hi96.shift(1)).astype(float) - (c < lo96.shift(1)).astype(float)).fillna(0.0)
 
     final[f'{pair}_ret1']      = ret1.astype('float32')
     final[f'{pair}_ret2']      = ret2.astype('float32')
     final[f'{pair}_ret4']      = ret4.astype('float32')
     final[f'{pair}_ret8']      = ret8.astype('float32')
     final[f'{pair}_ret16']     = ret16.astype('float32')
+    final[f'{pair}_ret32']     = ret32.astype('float32')
+    final[f'{pair}_ret64']     = ret64.astype('float32')
     final[f'{pair}_vol10']     = vol10.astype('float32')
     final[f'{pair}_vol20']     = vol20.astype('float32')
+    final[f'{pair}_vol_fast']  = vol_fast.astype('float32')
+    final[f'{pair}_vol_medium']= vol_medium.astype('float32')
+    final[f'{pair}_vol_slow']  = vol_slow.astype('float32')
+    final[f'{pair}_vol_ratio_fs'] = vol_ratio_fast_slow.astype('float32')
     final[f'{pair}_atr14raw']  = atr14.astype('float32')
     final[f'{pair}_atr14n']    = atr14n.astype('float32')
     final[f'{pair}_range_n']   = (range_raw / (c + 1e-10)).fillna(0.0).astype('float32')
@@ -593,28 +662,37 @@ for pair in FOREX_TICKERS:
     final[f'{pair}_rsi14']     = rsi14.astype('float32')
     final[f'{pair}_macdh']     = macdh.astype('float32')
     final[f'{pair}_ema_gap']   = ema_gap.astype('float32')
+    final[f'{pair}_trend_stack'] = trend_stack.astype('float32')
     final[f'{pair}_eff16']     = eff16.astype('float32')
+    final[f'{pair}_eff48']     = eff48.astype('float32')
     final[f'{pair}_momage']    = momage.astype('float32')
+    final[f'{pair}_slope16']   = slope16.astype('float32')
+    final[f'{pair}_slope48']   = slope48.astype('float32')
     final[f'{pair}_dist_hi20'] = dist_hi20.astype('float32')
     final[f'{pair}_dist_lo20'] = dist_lo20.astype('float32')
+    final[f'{pair}_dist_hi96'] = dist_hi96.astype('float32')
+    final[f'{pair}_dist_lo96'] = dist_lo96.astype('float32')
+    final[f'{pair}_breakout96']= breakout_96.astype('float32')
 
     # source-quality / synthetic-awareness features
     final[f'{pair}_quality'] = (
-        0.25 + 0.75 * final[f'{pair}_is_true30m']
-    ).astype('float32')
+        0.10 + 0.45 * final[f'{pair}_is_true30m'] + 0.45 * final[f'{pair}_is_true15m']
+    ).clip(0.10, 1.0).astype('float32')
     final[f'{pair}_parent_rng1h_n'] = (
         final[f'{pair}_parent_rng1h'] / (c + 1e-10)
     ).fillna(0.0).astype('float32')
     final[f'{pair}_parent_bdy1h_n'] = (
         final[f'{pair}_parent_bdy1h'] / (c + 1e-10)
     ).fillna(0.0).astype('float32')
+    final[f'{pair}_synth_pressure'] = (1.0 - final[f'{pair}_quality']).astype('float32')
+    final[f'{pair}_micro_regime'] = (0.40 * final[f'{pair}_vol_ratio_fs'] + 0.35 * final[f'{pair}_compress20'] + 0.25 * final[f'{pair}_trend_stack'].abs()).astype('float32')
 
     # simple future-return targets for diagnostics / optional supervised heads
     final[f'target_{pair}_ret_1']  = safe_logret(c.shift(-1), 0).astype('float32')
     final[f'target_{pair}_ret_4']  = safe_logret(c.shift(-4), 0).astype('float32')
     final[f'target_{pair}_ret_12'] = safe_logret(c.shift(-12), 0).astype('float32')
 
-    print(f"  [{pair}] ret1_std={ret1.std():.6f} | vol20_mean={vol20.mean():.6f} | true30m={final[f'{pair}_is_true30m'].mean()*100:.1f}%")
+    print(f"  [{pair}] ret1_std={ret1.std():.6f} | vol20_mean={vol20.mean():.6f} | true15m={final[f'{pair}_is_true15m'].mean()*100:.1f}%")
 
 # overwrite target calculations with proper future/log-return form
 for pair in FOREX_TICKERS:
@@ -647,6 +725,15 @@ for pair in FOREX_TICKERS:
     final[f'{pair}_x_energy']  = (final[f'{pair}_ret1'] * final['energy_stress']).astype('float32')
     final[f'{pair}_x_dxy']     = (final[f'{pair}_ret1'] * final.get('dxy_z96', 0.0)).astype('float32')
     final[f'{pair}_x_gstress'] = (final[f'{pair}_ret1'] * final['global_stress_score']).astype('float32')
+
+ret_cols = [f'{p}_ret1' for p in FOREX_TICKERS]
+vol_cols = [f'{p}_vol_fast' for p in FOREX_TICKERS]
+micro_cols = [f'{p}_micro_regime' for p in FOREX_TICKERS]
+final = final.join(add_cross_asset_lag_features(final, ret_cols, 'fx_ret_cluster'))
+final = final.join(add_cross_asset_lag_features(final, vol_cols, 'fx_vol_cluster'))
+final['fx_micro_regime_mean'] = final[micro_cols].mean(axis=1).fillna(0.0).astype('float32')
+final['fx_micro_regime_disp'] = final[micro_cols].std(axis=1).fillna(0.0).astype('float32')
+final['global_regime_fast_medium'] = (final['fx_micro_regime_mean'] * (1.0 + final['riskoff_score'].abs())).astype('float32')
 
 # ── Final clean-up ────────────────────────────────────────────────────────────
 final.replace([np.inf, -np.inf], np.nan, inplace=True)
