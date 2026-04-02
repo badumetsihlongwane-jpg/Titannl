@@ -81,6 +81,11 @@ K_TP         = 2.0       # TP multiple of ATR
 K_SL         = 1.5       # SL multiple of ATR
 # MAX_HOLD in bars: 6×30m = 3h horizon (same wall-clock as 12×15m)
 MAX_HOLD     = 6  if DATASET_INTERVAL == '30m' else 12
+MIN_STOP_MULT    = 0.5
+MIN_TARGET_MULT  = 0.5
+UNCERTAINTY_FREEZE_THRESHOLD = 0.7
+UNCERTAINTY_SOFT_THRESHOLD   = 0.45
+HOLD_BUCKETS = [1, 2, 4, 6, MAX_HOLD]
 
 try:
     _here = os.path.dirname(os.path.abspath(__file__))
@@ -375,17 +380,80 @@ class MarketRegimeMemory(nn.Module):
 
 
 # ==========================================
-# 6. NESTED GRAPH TITAN-NL v5 — DUAL-HEAD
+# 6. RISK GOVERNOR — SAFETY LAYER
+# ==========================================
+class RiskGovernor(nn.Module):
+    """
+    Lightweight risk gate that can veto or scale the alpha proposal.
+    This is not a full rule engine, but it enforces core principles:
+      • uncertainty shrinks gate/size
+      • high uncertainty can freeze trading
+      • stops widen slightly when uncertainty is high
+      • targets tighten modestly when risk is elevated
+    """
+    def __init__(self, high_uncertainty: float = UNCERTAINTY_SOFT_THRESHOLD,
+                 freeze_uncertainty: float = UNCERTAINTY_FREEZE_THRESHOLD,
+                 min_risk_scale: float = 0.1):
+        super().__init__()
+        self.high_uncertainty  = high_uncertainty
+        self.freeze_uncertainty= freeze_uncertainty
+        self.min_risk_scale    = min_risk_scale
+
+    def forward(self, policy: dict, session_ctx: Optional[torch.Tensor] = None) -> dict:
+        direction    = policy['direction']
+        trade_gate   = policy['trade_gate']
+        size         = policy['size']
+        stop_mult    = policy['stop_mult']
+        target_mult  = policy['target_mult']
+        hold_horizon = policy['hold_horizon']
+        uncertainty  = policy['uncertainty']
+        adapt_probs  = policy['adapt_mode_probs']
+
+        # Shrink risk when uncertainty is high
+        risk_scale   = torch.clamp(1.0 - uncertainty * 0.7, self.min_risk_scale, 1.0)
+        gate_penalty = torch.where(uncertainty > self.high_uncertainty, 0.35, 1.0)
+        final_gate   = trade_gate * gate_penalty
+        final_size   = size * risk_scale
+
+        # Adjust exits under uncertainty
+        stop_safe    = stop_mult * (1.0 + uncertainty * 0.4)
+        target_safe  = target_mult * torch.clamp(1.0 - uncertainty * 0.25, 0.35, 1.25)
+
+        # Adaptation policy override: if uncertainty is extreme, freeze
+        freeze_mask  = (uncertainty.squeeze(-1) > self.freeze_uncertainty)
+        adapt_mode   = torch.argmax(adapt_probs, dim=-1)
+        adapt_mode   = torch.where(freeze_mask, torch.full_like(adapt_mode, 2), adapt_mode)
+
+        position     = direction * final_gate * final_size * risk_scale
+
+        return {
+            'position': position,
+            'gate': final_gate,
+            'size': final_size,
+            'stop_mult': stop_safe,
+            'target_mult': target_safe,
+            'hold_horizon': hold_horizon,
+            'risk_scale': risk_scale,
+            'adapt_mode': adapt_mode,
+        }
+
+
+# ==========================================
+# 6. NESTED GRAPH TITAN-NL v6 — TRADER POLICY
 # ==========================================
 class NestedGraphTitanNL(nn.Module):
     """
-    v5.0: Dual-head output:
-      • direction_head  → tanh → [-1, 1]   (long / short strength)
-      • gate_head       → sigmoid → [0, 1] (trade confidence / "do nothing" gate)
-
-    Effective signal = direction * gate.
-    Gate ≈ 0 means flat — the model learns to skip low-conviction bars.
-    Output shape is unchanged: [B, N, 1], compatible with all downstream code.
+    v6.0: Trader policy outputs:
+      • direction_head  → tanh → [-1, 1]
+      • gate_head       → sigmoid → [0, 1]
+      • size_head       → sigmoid → [0, 1]
+      • stop_head       → softplus + MIN_STOP_MULT
+      • target_head     → softplus + MIN_TARGET_MULT
+      • hold_head       → sigmoid scaled to MAX_HOLD
+      • uncertainty_head→ sigmoid → [0, 1]
+      • regime_head     → softmax over 3 classes
+      • adapt_head      → softmax over 3 modes
+    RiskGovernor produces the final approved position.
     """
 
     def __init__(self, num_nodes: int = NUM_NODES, feats_per_node: int = 34,
@@ -413,21 +481,39 @@ class NestedGraphTitanNL(nn.Module):
         self.cms           = ContinuumMemoryMLP(d_model, cms_chunk_sizes, expansion=3, dropout=dropout)
         self.regime_memory = MarketRegimeMemory(num_nodes, d_model, dropout)
 
-        # Shared trunk for both heads
+        # Shared trunk for policy heads
         self.trunk = nn.Sequential(
             nn.Linear(d_model, d_model // 2), nn.GELU(), nn.Dropout(dropout)
         )
 
-        # Head 1: direction signal  [-1, 1]
+        # Core heads
         self.direction_head = nn.Sequential(
             nn.Linear(d_model // 2, 1), nn.Tanh()
         )
-        # Head 2: trade gate / confidence  [0, 1]
-        # Bias init > 0 so gate starts slightly open, preventing dead-gate at step 0
         self.gate_head = nn.Sequential(
             nn.Linear(d_model // 2, 1), nn.Sigmoid()
         )
         nn.init.constant_(self.gate_head[0].bias, 0.5)
+
+        self.size_head = nn.Sequential(
+            nn.Linear(d_model // 2, 1), nn.Sigmoid()
+        )
+        self.stop_head = nn.Sequential(
+            nn.Linear(d_model // 2, 1), nn.Softplus()
+        )
+        self.target_head = nn.Sequential(
+            nn.Linear(d_model // 2, 1), nn.Softplus()
+        )
+        self.hold_head = nn.Sequential(
+            nn.Linear(d_model // 2, 1), nn.Sigmoid()
+        )
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(d_model // 2, 1), nn.Sigmoid()
+        )
+        self.regime_transition_head = nn.Linear(d_model // 2, 3)
+        self.adapt_policy_head      = nn.Linear(d_model // 2, 3)
+
+        self.risk_governor = RiskGovernor()
 
         self._init_weights()
 
@@ -439,6 +525,7 @@ class NestedGraphTitanNL(nn.Module):
                     nn.init.zeros_(m.bias)
         # Re-apply gate bias after global zero-init
         nn.init.constant_(self.gate_head[0].bias, 0.5)
+        nn.init.constant_(self.size_head[0].bias, -0.25)
 
     def forward(
         self,
@@ -450,8 +537,7 @@ class NestedGraphTitanNL(nn.Module):
         """
         Returns
         -------
-        signal         : [B, N, 1]  gated signal = direction * gate
-        current_states : list of M tensors (one per delta-memory layer)
+        dict with raw policy heads, final_policy (risk-adjusted), and states.
         """
         b, s, n, f = x.shape
         x   = self.embedding(x)                                   # [B, S, N, D]
@@ -473,11 +559,40 @@ class NestedGraphTitanNL(nn.Module):
         trunk     = self.trunk(graph_out)                         # [B, N, D//2]
         direction = self.direction_head(trunk)                    # [B, N, 1]
         gate      = self.gate_head(trunk)                         # [B, N, 1]
-        signal    = direction * gate                              # [B, N, 1]  effective position
+        size      = self.size_head(trunk)                         # [B, N, 1]
+        stop_mult = self.stop_head(trunk) + MIN_STOP_MULT         # [B, N, 1]
+        target_mult = self.target_head(trunk) + MIN_TARGET_MULT   # [B, N, 1]
+        hold_horizon = self.hold_head(trunk) * MAX_HOLD           # [B, N, 1]
+        uncertainty  = self.uncertainty_head(trunk)               # [B, N, 1]
+        regime_logits= self.regime_transition_head(trunk)         # [B, N, 3]
+        adapt_logits = self.adapt_policy_head(trunk)              # [B, N, 3]
+        regime_out   = F.softmax(regime_logits, dim=-1)
+        adapt_out    = F.softmax(adapt_logits, dim=-1)
+
+        base_policy = {
+            'direction': direction,
+            'trade_gate': gate,
+            'size': size,
+            'stop_mult': stop_mult,
+            'target_mult': target_mult,
+            'hold_horizon': hold_horizon,
+            'uncertainty': uncertainty,
+            'regime_probs': regime_out,
+            'adapt_mode_probs': adapt_out,
+        }
+
+        final_policy = self.risk_governor(base_policy)
+
+        outputs = {
+            **base_policy,
+            'final_policy': final_policy,
+            'states': current_states,
+        }
 
         if return_attn:
-            return signal, current_states, attn_weights, alpha, gate
-        return signal, current_states
+            outputs['attn_weights'] = attn_weights
+            outputs['alpha'] = alpha
+        return outputs
 
 
 # ==========================================
@@ -555,26 +670,107 @@ class RealPnLLoss(nn.Module):
 
 
 # ==========================================
+# 7b. TRADER COMPOSITE LOSS (v6)
+# ==========================================
+class TraderCompositeLoss(nn.Module):
+    """
+    Wraps RealPnLLoss with auxiliary policy-head supervision.
+    Targets are heuristics derived from future returns and volatility so the
+    new heads learn sensible defaults even without bespoke labels.
+    """
+    def __init__(self):
+        super().__init__()
+        self.pnl_loss   = RealPnLLoss()
+        self.bce        = nn.BCELoss()
+        self.mse        = nn.MSELoss()
+        self.ce         = nn.CrossEntropyLoss()
+
+    def forward(
+        self,
+        outputs: dict,
+        targets: torch.Tensor,
+        policy_targets: Optional[dict] = None,
+        prev_sig: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        final_pos = outputs['final_policy']['position']
+        loss = self.pnl_loss(final_pos, targets, prev_sig=prev_sig)
+
+        if policy_targets is None:
+            return loss
+
+        # Align auxiliary heads to heuristics
+        dir_tgt   = policy_targets['direction'].to(final_pos.device)
+        gate_tgt  = policy_targets['trade_gate'].to(final_pos.device)
+        size_tgt  = policy_targets['size'].to(final_pos.device)
+        stop_tgt  = policy_targets['stop_mult'].to(final_pos.device)
+        tp_tgt    = policy_targets['target_mult'].to(final_pos.device)
+        hold_tgt  = policy_targets['hold_horizon'].to(final_pos.device)
+        unc_tgt   = policy_targets['uncertainty'].to(final_pos.device)
+        regime_t  = policy_targets['regime'].to(final_pos.device)
+        adapt_t   = policy_targets['adapt_mode'].to(final_pos.device)
+
+        direction = outputs['direction'].squeeze(-1)
+        gate      = outputs['trade_gate'].squeeze(-1)
+        size      = outputs['size'].squeeze(-1)
+        stop_mult = outputs['stop_mult'].squeeze(-1)
+        target_m  = outputs['target_mult'].squeeze(-1)
+        hold      = outputs['hold_horizon'].squeeze(-1)
+        unc       = outputs['uncertainty'].squeeze(-1)
+        regime_p  = outputs['regime_probs']
+        adapt_p   = outputs['adapt_mode_probs']
+
+        aux_loss = 0.0
+        aux_loss = aux_loss + self.mse(direction, dir_tgt)
+        aux_loss = aux_loss + self.bce(gate, gate_tgt)
+        aux_loss = aux_loss + self.mse(size, size_tgt)
+        aux_loss = aux_loss + self.mse(stop_mult, stop_tgt)
+        aux_loss = aux_loss + self.mse(target_m, tp_tgt)
+        aux_loss = aux_loss + self.mse(hold, hold_tgt)
+        aux_loss = aux_loss + self.mse(unc, unc_tgt)
+        aux_loss = aux_loss + self.ce(regime_p.transpose(1, 2), regime_t)
+        aux_loss = aux_loss + self.ce(adapt_p.transpose(1, 2), adapt_t)
+
+        return loss + 0.2 * aux_loss
+
+
+# ==========================================
 # 8. SEQUENTIAL (CHUNK) DATASET
 # ==========================================
 class SequentialForexDataset(Dataset):
     """
     Non-overlapping, strictly chronological chunks.
-    Each item returns (features [S, N, F], future_returns [S, N]).
+    Each item returns (features [S, N, F], future_returns [S, N], policy_targets dict).
     """
-    def __init__(self, X: np.ndarray, returns: np.ndarray, chunk_len: int):
+    def __init__(self, X: np.ndarray, returns: np.ndarray, policy_targets: dict,
+                 chunk_len: int):
         self.X         = torch.FloatTensor(X)
         self.returns   = torch.FloatTensor(returns)
+        self.policy_targets = {k: torch.tensor(v) for k, v in policy_targets.items()}
         self.chunk_len = chunk_len
         self.n_chunks  = len(X) // chunk_len
 
     def __len__(self) -> int:
         return self.n_chunks
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         s = idx * self.chunk_len
         e = s + self.chunk_len
-        return self.X[s:e], self.returns[s:e]
+        targets = {}
+        for key, val in self.policy_targets.items():
+            slice_val = val[s:e]
+            if slice_val.ndim == 3:   # [S, N, C] probabilities
+                targets[key] = slice_val.mean(dim=0)
+            elif val.dtype in (torch.int64, torch.int32):
+                # majority vote per node
+                modes = []
+                for n in range(slice_val.shape[1]):
+                    counts = torch.bincount(slice_val[:, n].flatten().long(), minlength=3)
+                    modes.append(torch.argmax(counts))
+                targets[key] = torch.stack(modes)
+            else:
+                targets[key] = slice_val.mean(dim=0)
+
+        return self.X[s:e], self.returns[s:e], targets
 
 
 # ==========================================
@@ -612,27 +808,37 @@ def train_epoch(
     prev_sig    = None          # for transaction-cost turnover term
     use_amp     = (device.type == 'cuda')
 
-    for x, r in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            x, r, policy_targets = batch
+        else:
+            x, r = batch
+            policy_targets = None
+
         x, r = x.to(device), r.to(device)
+        if policy_targets is not None:
+            policy_targets = {k: v.to(device) for k, v in policy_targets.items()}
         x    = torch.clamp(x + torch.randn_like(x) * NOISE_STD, -10.0, 10.0)
 
         optimizer.zero_grad()
         if use_amp:
             with torch.amp.autocast('cuda'):
-                signal, current_states = model(x, prev_states=prev_states, step=step_counter)
-                loss = criterion(signal, r, prev_sig=prev_sig)
+                outputs = model(x, prev_states=prev_states, step=step_counter)
+                loss = criterion(outputs, r, policy_targets=policy_targets, prev_sig=prev_sig)
             amp_scaler.scale(loss).backward()
             amp_scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             amp_scaler.step(optimizer)
             amp_scaler.update()
         else:
-            signal, current_states = model(x, prev_states=prev_states, step=step_counter)
-            loss = criterion(signal, r, prev_sig=prev_sig)
+            outputs = model(x, prev_states=prev_states, step=step_counter)
+            loss = criterion(outputs, r, policy_targets=policy_targets, prev_sig=prev_sig)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
+        signal        = outputs['final_policy']['position']
+        current_states= outputs['states']
         prev_states  = [s.detach() for s in current_states]
         prev_sig     = signal.squeeze(-1).detach()
         total_loss  += loss.item()
@@ -663,15 +869,24 @@ def evaluate(
     prev_states = initial_states
     prev_sig    = None
 
-    for x, r in loader:
+    for batch in loader:
+        if len(batch) == 3:
+            x, r, policy_targets = batch
+        else:
+            x, r = batch
+            policy_targets = None
+
         x, r = x.to(device), r.to(device)
+        if policy_targets is not None:
+            policy_targets = {k: v.to(device) for k, v in policy_targets.items()}
         x    = torch.clamp(x, -10.0, 10.0)
-        signal, current_states = model(x, prev_states=prev_states)
-        loss         = criterion(signal, r, prev_sig=prev_sig)
+        outputs = model(x, prev_states=prev_states)
+        loss    = criterion(outputs, r, policy_targets=policy_targets, prev_sig=prev_sig)
+        current_states = outputs['states']
         prev_states  = current_states
-        prev_sig     = signal.squeeze(-1)
+        prev_sig     = outputs['final_policy']['position'].squeeze(-1)
         total_loss  += loss.item()
-        sig_chunk    = signal.squeeze(-1)    # [B, N]
+        sig_chunk    = outputs['final_policy']['position'].squeeze(-1)    # [B, N]
         r_net        = r.sum(dim=1)          # [B, N]
         # Recover gate magnitude: |gated_sig| / (|direction| + eps)
         # We can't separate direction from gate here, so just store |sig| as gate proxy
@@ -711,7 +926,9 @@ def online_evolve(
     observed_return = observed_return.to(device)
 
     online_optimizer.zero_grad()
-    signal, current_states = model(x_bar, prev_states=prev_states)
+    outputs = model(x_bar, prev_states=prev_states)
+    signal = outputs['final_policy']['position']
+    current_states = outputs['states']
     sig = signal.squeeze(-1)                             # [1, N]
 
     # Vol-scale position
@@ -906,6 +1123,66 @@ def load_titan_dataset(path: str):
           f"SL%={sl_hits_total/(T_total*NUM_NODES+1)*100:.1f}  "
           f"Expired%={expire_total/(T_total*NUM_NODES+1)*100:.1f}")
 
+    # ── Session / calendar features (shared across nodes) ───────────────
+    hours = df.index.hour.values
+    dows  = df.index.dayofweek.values
+    hour_sin = np.sin(2 * np.pi * hours / 24.0)
+    hour_cos = np.cos(2 * np.pi * hours / 24.0)
+    dow_sin  = np.sin(2 * np.pi * dows / 7.0)
+    dow_cos  = np.cos(2 * np.pi * dows / 7.0)
+    asia     = ((hours >= 0) & (hours < 8)).astype(np.float32)
+    london   = ((hours >= 8) & (hours < 16)).astype(np.float32)
+    ny       = ((hours >= 13) & (hours < 21)).astype(np.float32)
+    overlap  = (london * ny).astype(np.float32)
+    session_cols = [
+        "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+        "session_asia", "session_london", "session_ny", "session_overlap"
+    ]
+    session_feats = np.stack([hour_sin, hour_cos, dow_sin, dow_cos,
+                              asia, london, ny, overlap], axis=1).astype(np.float32)
+    session_expanded = np.repeat(session_feats[:, None, :], NUM_NODES, axis=1)
+    master = np.concatenate([master, session_expanded], axis=2)
+    shared_cols = shared_cols + session_cols
+    feats_per_node = master.shape[2]
+
+    # ── Policy supervision targets for v6 heads ────────────────────────
+    abs_rets      = np.abs(future_rets)
+    rolling_vol   = pd.DataFrame(abs_rets, columns=PAIRS).ewm(span=ATR_PERIOD,
+                    adjust=False).mean().values.astype(np.float32)
+    gate_threshold= np.percentile(abs_rets, 55, axis=0)
+
+    direction_target = np.tanh(future_rets / (rolling_vol + 1e-6)).astype(np.float32)
+    trade_gate_target= (abs_rets > gate_threshold).astype(np.float32)
+    size_target      = np.clip(abs_rets / (rolling_vol + 1e-6), 0.0, 1.5).astype(np.float32)
+    stop_mult_target = np.clip(
+        (rolling_vol / (abs_rets.mean(axis=0) + 1e-6)) + K_SL * 0.25,
+        MIN_STOP_MULT, 4.0
+    ).astype(np.float32)
+    target_mult_target = np.clip(
+        (abs_rets / (rolling_vol + 1e-6)) + K_TP * 0.25,
+        MIN_TARGET_MULT, 5.0
+    ).astype(np.float32)
+    hold_target = np.clip(rolling_vol / (abs_rets + 1e-6), 0.0, 1.0) * MAX_HOLD
+    uncertainty_target = np.clip(rolling_vol / (abs_rets + 1e-6), 0.0, 1.0)
+    regime_class = np.where(direction_target > 0.15, 0,
+                            np.where(direction_target < -0.15, 1, 2)).astype(np.int64)
+    adapt_mode = np.where(
+        uncertainty_target > UNCERTAINTY_FREEZE_THRESHOLD, 2,
+        np.where(uncertainty_target > UNCERTAINTY_SOFT_THRESHOLD, 0, 1)
+    ).astype(np.int64)
+
+    policy_targets = {
+        'direction': direction_target,
+        'trade_gate': trade_gate_target,
+        'size': size_target,
+        'stop_mult': stop_mult_target,
+        'target_mult': target_mult_target,
+        'hold_horizon': hold_target.astype(np.float32),
+        'uncertainty': uncertainty_target.astype(np.float32),
+        'regime': regime_class,
+        'adapt_mode': adapt_mode,
+    }
+
 
     # ── Save feature schema for live inference ───────────────────────────
     import json
@@ -916,15 +1193,15 @@ def load_titan_dataset(path: str):
                   if c in numeric_cols
                   and (c.startswith(p) or c.startswith(p_lo))
                   and not c.startswith('target_')]
-        schema_cols[p] = (p_cols + shared_cols)[:min_feats]
-    schema = {'pairs': PAIRS, 'feats_per_node': min_feats,
+        schema_cols[p] = (p_cols + shared_cols)[:feats_per_node]
+    schema = {'pairs': PAIRS, 'feats_per_node': feats_per_node,
               'shared_cols': shared_cols, 'node_cols': schema_cols}
     with open('titan_feature_schema.json', 'w') as _sf:
         json.dump(schema, _sf)
 
     print(f"    Master tensor: {master.shape} | feats/node: {feats_per_node}")
     print(f"    Pairs: {PAIRS} | shared cols: {len(shared_cols)}")
-    return master, future_rets, feats_per_node, df.index
+    return master, future_rets, feats_per_node, df.index, policy_targets
 
 
 # ==========================================
@@ -936,7 +1213,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # ── Load ─────────────────────────────────────────────────────────────
-    master, future_returns, feats_per_node, dates = load_titan_dataset(DATASET_PATH)
+    master, future_returns, feats_per_node, dates, policy_targets = load_titan_dataset(DATASET_PATH)
 
     train_mask = (dates >= TRAIN_START) & (dates <= TRAIN_END)
     val_mask   = (dates >= VAL_START)   & (dates <= VAL_END)
@@ -966,8 +1243,12 @@ if __name__ == "__main__":
         pickle.dump(scaler, f)
 
     # ── Datasets ─────────────────────────────────────────────────────────
-    train_ds = SequentialForexDataset(scaled[train_idx], future_returns[train_idx], CHUNK_LEN)
-    val_ds   = SequentialForexDataset(scaled[val_idx],   future_returns[val_idx],   CHUNK_LEN)
+    train_ds = SequentialForexDataset(scaled[train_idx], future_returns[train_idx],
+                                      {k: v[train_idx] for k, v in policy_targets.items()},
+                                      CHUNK_LEN)
+    val_ds   = SequentialForexDataset(scaled[val_idx],   future_returns[val_idx],
+                                      {k: v[val_idx] for k, v in policy_targets.items()},
+                                      CHUNK_LEN)
 
     print(f"  Chunks → Train: {len(train_ds)}  Val: {len(val_ds)}  (chunk_len={CHUNK_LEN})")
 
@@ -990,8 +1271,12 @@ if __name__ == "__main__":
     calib_idx    = np.where(calib_mask)[0]
     backtest_idx = np.where(backtest_mask)[0]
 
-    calib_ds    = SequentialForexDataset(scaled[calib_idx],    future_returns[calib_idx],    CHUNK_LEN)
-    backtest_ds = SequentialForexDataset(scaled[backtest_idx], future_returns[backtest_idx], CHUNK_LEN)
+    calib_ds    = SequentialForexDataset(scaled[calib_idx],    future_returns[calib_idx],
+                                         {k: v[calib_idx] for k, v in policy_targets.items()},
+                                         CHUNK_LEN)
+    backtest_ds = SequentialForexDataset(scaled[backtest_idx], future_returns[backtest_idx],
+                                         {k: v[backtest_idx] for k, v in policy_targets.items()},
+                                         CHUNK_LEN)
     calib_loader    = DataLoader(calib_ds,    batch_size=1, shuffle=False)
     backtest_loader = DataLoader(backtest_ds, batch_size=1, shuffle=False)
 
@@ -1012,7 +1297,7 @@ if __name__ == "__main__":
     total_params = sum(p.numel() for p in model.parameters())
     print(f"\n  Model Parameters: {total_params:,}")
 
-    criterion = RealPnLLoss()
+    criterion = TraderCompositeLoss()
     optimizer = M3Optimizer(model.parameters(), lr=LR, betas=(0.9, 0.95, 0.999), weight_decay=1e-3)
     amp_scaler = torch.amp.GradScaler('cuda') if DEVICE.type == 'cuda' else None
 
@@ -1068,13 +1353,17 @@ if __name__ == "__main__":
     calib_opt = optim.AdamW(model.parameters(), lr=ONLINE_LR * 10, weight_decay=1e-4)
     calib_pnl_hist  = []
     calib_prev_sig  = None
-    for x_c, r_c in calib_loader:
+    for batch in calib_loader:
+        x_c, r_c, pol_c = batch
         x_c, r_c = x_c.to(DEVICE), r_c.to(DEVICE)
+        pol_c = {k: v.to(DEVICE) for k, v in pol_c.items()}
         model.train()
         calib_opt.zero_grad()
-        sig_c, states = model(x_c, prev_states=states)
+        outputs = model(x_c, prev_states=states)
+        sig_c  = outputs['final_policy']['position']
+        states = outputs['states']
         states  = [s.detach() for s in states]
-        loss_c  = criterion(sig_c, r_c, prev_sig=calib_prev_sig)
+        loss_c  = criterion(outputs, r_c, policy_targets=pol_c, prev_sig=calib_prev_sig)
         loss_c.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         calib_opt.step()
